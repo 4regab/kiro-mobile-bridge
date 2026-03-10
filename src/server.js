@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 // Services
 import { fetchCDPTargets, connectToCDP } from './services/cdp.js';
 import { captureMetadata, captureCSS, captureSnapshot, captureEditor } from './services/snapshot.js';
+import { KiroAdapter } from '../kiro-adapter.js';
 
 // Utils
 import { generateId, computeHash } from './utils/hash.js';
@@ -67,6 +68,10 @@ if (!NO_AUTH) {
 const cascades = new Map(); // cascadeId -> { id, cdp, metadata, snapshot, css, snapshotHash, editor, editorHash }
 const mainWindowCDP = { connection: null, id: null };
 
+// Kiro Adapter for file system monitoring
+const kiroAdapter = new KiroAdapter('.');
+let kiroData = null;
+
 const pollingState = {
   lastCascadeCount: 0,
   lastMainWindowConnected: false,
@@ -88,13 +93,17 @@ async function discoverTargets() {
   let foundMainWindow = false;
   let stateChanged = false;
 
+  // Try standard CDP discovery first
   const portResults = await Promise.allSettled(
     CDP_PORTS.map(port => fetchCDPTargets(port).then(targets => ({ port, targets })))
   );
 
+  let hasCDPTargets = false;
+  
   for (const result of portResults) {
     if (result.status !== 'fulfilled') continue;
     const { port, targets } = result.value;
+    hasCDPTargets = true;
 
     try {
       // Find main VS Code window
@@ -177,9 +186,37 @@ async function discoverTargets() {
     }
   }
 
+  // If no CDP targets found, try Kiro file system monitoring
+  if (!hasCDPTargets && !kiroData) {
+    console.log('[Discovery] No CDP targets found, starting Kiro file system monitoring...');
+    try {
+      kiroData = kiroAdapter.start();
+      
+      // Create a mock cascade for Kiro
+      const kiroId = 'kiro-filesystem';
+      cascades.set(kiroId, {
+        id: kiroId,
+        cdp: null, // No CDP connection
+        metadata: { windowTitle: 'Kiro IDE', chatTitle: 'File System Monitor', isActive: true },
+        snapshot: null,
+        css: '',
+        snapshotHash: null,
+        editor: null,
+        editorHash: null,
+        isKiroAdapter: true
+      });
+      
+      stateChanged = true;
+      foundMainWindow = true;
+      console.log('[Discovery] Kiro file system monitoring active');
+    } catch (err) {
+      console.error('[Discovery] Failed to start Kiro adapter:', err.message);
+    }
+  }
+
   // Clean up disconnected targets
   for (const [cascadeId, cascade] of cascades) {
-    if (!foundCascadeIds.has(cascadeId)) {
+    if (!foundCascadeIds.has(cascadeId) && !cascade.isKiroAdapter) {
       console.log(`[Discovery] Target no longer available: ${cascadeId}`);
       stateChanged = true;
       try {
@@ -214,7 +251,58 @@ async function pollSnapshots() {
 
   for (const [cascadeId, cascade] of cascades) {
     try {
+      // Handle Kiro file system adapter
+      if (cascade.isKiroAdapter && kiroData) {
+        // Update chat from file system
+        const chatHistory = kiroData.getChatHistory();
+        if (chatHistory.length > 0) {
+          const chatHtml = chatHistory.map(msg => 
+            `<div class="message ${msg.role}">${msg.content}</div>`
+          ).join('');
+          
+          const newHash = computeHash(chatHtml);
+          if (newHash !== cascade.snapshotHash) {
+            cascade.snapshot = { html: chatHtml, bodyBg: '#1e1e1e', bodyColor: '#ffffff' };
+            cascade.snapshotHash = newHash;
+            broadcastSnapshotUpdate(cascadeId, 'chat');
+            anyChanges = true;
+          }
+        }
+
+        // Update editor from file system
+        const currentFile = kiroData.getCurrentFile();
+        if (currentFile && currentFile.hasContent) {
+          const editorHash = computeHash(currentFile.content + currentFile.fileName);
+          if (editorHash !== cascade.editorHash) {
+            cascade.editor = currentFile;
+            cascade.editorHash = editorHash;
+            broadcastSnapshotUpdate(cascadeId, 'editor');
+            anyChanges = true;
+          }
+        }
+
+        // Update tasks from file system
+        const tasks = kiroData.getTasks();
+        if (tasks.length > 0) {
+          const tasksHtml = tasks.map(task => 
+            `<div class="task ${task.completed ? 'completed' : 'pending'}">
+              <input type="checkbox" ${task.completed ? 'checked' : ''} disabled>
+              <span>${task.title}</span>
+            </div>`
+          ).join('');
+          
+          // Store tasks in a custom property for the tasks panel
+          cascade.tasks = { html: tasksHtml, tasks: tasks };
+          broadcastSnapshotUpdate(cascadeId, 'tasks');
+          anyChanges = true;
+        }
+
+        continue;
+      }
+
+      // Standard CDP handling
       const cdp = cascade.cdp;
+      if (!cdp) continue;
 
       // Capture CSS once
       if (cascade.css === null) {
@@ -239,7 +327,6 @@ async function pollSnapshots() {
       }
 
       // Capture editor from main window
-      // Store rootContextId locally to avoid race conditions during async operations
       const mainCDP = mainWindowCDP.connection;
       const contextId = mainCDP?.rootContextId;
       if (mainCDP && contextId) {
