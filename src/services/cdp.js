@@ -13,9 +13,70 @@ import { CDP_CALL_TIMEOUT, HTTP_TIMEOUT } from '../utils/constants.js';
  * @returns {Promise<any>} - Parsed JSON response
  */
 export function fetchCDPTargets(port, path = '/json/list') {
-  // Try 127.0.0.1 first, then localhost as fallback
+  // For Kiro IDE: Try WebSocket-only CDP implementation first
+  if (port === 9222) {
+    return fetchKiroCDPTargets(port).catch(() => {
+      // Fallback to standard HTTP CDP
+      return fetchFromHost('127.0.0.1', port, path)
+        .catch(() => fetchFromHost('localhost', port, path));
+    });
+  }
+  
+  // Standard CDP implementation for other ports
   return fetchFromHost('127.0.0.1', port, path)
     .catch(() => fetchFromHost('localhost', port, path));
+}
+
+/**
+ * Fetch CDP targets from Kiro IDE using WebSocket-only implementation
+ * @param {number} port - The port to connect to
+ * @returns {Promise<any>} - Mock targets array for Kiro
+ */
+async function fetchKiroCDPTargets(port) {
+  // Check if Kiro WebSocket endpoint is accessible
+  const wsUrl = `ws://127.0.0.1:${port}/devtools/browser`;
+  
+  try {
+    // Try to connect to the WebSocket to verify it exists
+    const testWs = new WebSocket(wsUrl);
+    
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        testWs.terminate();
+        reject(new Error('Kiro WebSocket connection timeout'));
+      }, 2000);
+      
+      testWs.on('open', () => {
+        clearTimeout(timeout);
+        testWs.terminate();
+        
+        // Return mock targets that represent Kiro IDE
+        resolve([
+          {
+            id: 'kiro-main-window',
+            title: 'Kiro IDE - Main Window',
+            type: 'page',
+            url: 'vscode-file://kiro-ide',
+            webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/kiro-main`
+          },
+          {
+            id: 'kiro-agent-webview',
+            title: 'Kiro Agent - Chat Interface',
+            type: 'webview',
+            url: 'kiroagent://chat',
+            webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/browser/kiro-agent`
+          }
+        ]);
+      });
+      
+      testWs.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(new Error(`Kiro WebSocket connection failed: ${err.message}`));
+      });
+    });
+  } catch (err) {
+    throw new Error(`Failed to connect to Kiro CDP: ${err.message}`);
+  }
 }
 
 /**

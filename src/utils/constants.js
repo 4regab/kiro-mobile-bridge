@@ -5,9 +5,10 @@
 
 /**
  * CDP ports to scan for Kiro instances
+ * Port 9222 is prioritized for Kiro IDE (Electron default)
  * @type {number[]}
  */
-export const CDP_PORTS = [9000, 9001, 9002, 9003, 9222, 9229];
+export const CDP_PORTS = [9222, 9000, 9001, 9002, 9003, 9229];
 
 /**
  * Model names for AI model detection and matching
